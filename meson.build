@@ -7,27 +7,10 @@ fs = import('fs')
 
 cc = meson.get_compiler('c')
 
-enable_rust = get_option('enable_rust')
 
 bpf_clang = find_program(get_option('bpf_clang'))
 
-run_veristat = find_program(join_paths(meson.current_source_dir(),
-                                       'meson-scripts/veristat'))
-run_veristat_diff = find_program(join_paths(meson.current_source_dir(),
-                                       'meson-scripts/veristat_diff'))
-
-enable_stress = get_option('enable_stress')
-
-veristat_scheduler = get_option('veristat_scheduler')
-
-veristat_diff_dir = get_option('veristat_diff_dir')
-
 build_outside_src = get_option('build_outside_src')
-
-if enable_stress
-  run_stress_tests = find_program(join_paths(meson.current_source_dir(),
-                                      'meson-scripts/run_stress_tests'))
-endif
 
 get_clang_ver = find_program(join_paths(meson.current_source_dir(),
                                         'meson-scripts/get_clang_ver'))
@@ -39,8 +22,6 @@ bpftool_build_skel_lib = find_program(join_paths(meson.current_source_dir(),
                                              'meson-scripts/bpftool_build_skel_lib'))
 get_sys_incls = find_program(join_paths(meson.current_source_dir(),
                                         'meson-scripts/get_sys_incls'))
-test_sched  = find_program(join_paths(meson.current_source_dir(),
-                                      'meson-scripts/test_sched'))
 fetch_libbpf = find_program(join_paths(meson.current_source_dir(),
                                       'meson-scripts/fetch_libbpf'))
 build_libbpf = find_program(join_paths(meson.current_source_dir(),
@@ -307,207 +288,6 @@ gen_bpf_skel_lib = generator(bpftool_build_skel_lib,
                          depends: [libbpf, bpftool_target, scx_lib],
                          arguments: [bpftool_exe_path, '@INPUT@', '@OUTPUT0@', '@OUTPUT1@', scx_lib_path])
 
-#
-# For rust sub-projects.
-#
-cargo_build_args = ['--quiet']
-if get_option('buildtype') == 'release' or get_option('buildtype') == 'plain'
-  cargo_build_args += '--release'
-endif
-
-if get_option('offline')
-  cargo_build_args += '--offline'
-endif
-
-if get_option('kernel') != ''
-  kernel = get_option('kernel')
-endif
-
-if meson.is_cross_build()
-  cargo_target = host_machine.cpu_family() + '-unknown-' + host_machine.kernel() + '-gnu'
-  cargo_build_args += ['--target', cargo_target]
-endif
-
-if enable_rust
-  cargo = find_program(get_option('cargo'))
-  cargo_fetch = find_program(join_paths(meson.current_source_dir(),
-                                      'meson-scripts/cargo_fetch'))
-  cargo_env = environment()
-  cargo_env.set('BPF_CLANG', bpf_clang.full_path())
-
-  meson.add_install_script('meson-scripts/install_rust_user_scheds')
-
-  foreach flag: bpf_base_cflags
-    cargo_env.append('BPF_BASE_CFLAGS', flag, separator: ' ')
-  endforeach
-
-  if libbpf_a != ''
-    foreach header: libbpf_h
-      cargo_env.append('BPF_EXTRA_CFLAGS_PRE_INCL', '-I' + header, separator: ' ')
-    endforeach
-
-    cargo_env.append('RUSTFLAGS',
-                     '-C relocation-model=pic -C link-args=-lelf -C link-args=-lz -C link-args=-lzstd -L '
-                     + fs.parent(libbpf_a), separator: ' ')
-
-    #
-    # XXX - scx_rusty's original Cargo.toml contained a dependency matching
-    # the following. However, it doesn't seem necessary to enable linking to
-    # libbpf.a. Ask Dan Schatzberg about the role the dependency line plays.
-    #
-    #cargo_build_args += ['--config',
-    #                     'dependencies.libbpf-sys.version="1.2"',
-    #                     '--config',
-    #                     'dependencies.libbpf-sys.features=["novendor", "static"]']
-  endif
-
-  if get_option('cargo_home') != ''
-    cargo_env.set('CARGO_HOME', get_option('cargo_home'))
-  endif
-
-  run_target('fetch', command: [cargo_fetch, cargo], env: cargo_env)
-
-  rust_scheds = ['scx_lavd', 'scx_bpfland', 'scx_rustland', 'scx_rlfifo',
-                 'scx_flash', 'scx_rusty', 'scx_p2dq',
-                 'scx_layered', 'scx_mitosis', 'scx_tickless', 'scx_chaos']
-  rust_misc = ['scx_stats', 'scx_stats_derive', 'scx_utils',
-               'scx_rustland_core',
-               'scx_loader']
-
-  sched_deps = [libbpf, bpftool_target]
-  cargo_cmd = [cargo, 'build', '--manifest-path=@INPUT@', '--target-dir=@OUTDIR@',
-               cargo_build_args]
-
-  # target to compile all rust subprojects
-  custom_target('rust_all',
-                output: '@PLAINNAME@.__PHONY__',
-                input: 'Cargo.toml',
-                command: cargo_cmd,
-                env: cargo_env,
-                depends: sched_deps,
-                build_by_default: true,
-                build_always_stale: true)
-
-  # targets to build individual rust subprojects
-  foreach p : rust_scheds + rust_misc
-    custom_target(p,
-                  output: p + '@PLAINNAME@.__PHONY__',
-                  input: 'Cargo.toml',
-                  command: cargo_cmd + ['-p', p],
-                  env: cargo_env,
-                  depends: sched_deps,
-                  build_by_default: false,
-                  build_always_stale: true)
-  endforeach
-else
-  rust_scheds = []
-endif
-
-run_target('test_sched', command: [test_sched, kernel])
-run_target('veristat', command: [run_veristat, meson.current_build_dir(),
-                                 get_option('veristat_scheduler'), get_option('kernel')])
-
-if get_option('vng_rw_mount') == true
-  foreach s : rust_scheds
-    run_target('test_sched_'+s, command: [test_sched, kernel, s, 'VNG_RW=true'])
-    run_target('veristat_'+s, command: [run_veristat, meson.current_build_dir(),
-                                   get_option('veristat_scheduler'), get_option('kernel'), s, 'VNG_RW=true'])
-  endforeach
-else
-  foreach s : rust_scheds
-    run_target('test_sched_'+s, command: [test_sched, kernel, s])
-    run_target('veristat_'+s, command: [run_veristat, meson.current_build_dir(),
-                                   get_option('veristat_scheduler'), get_option('kernel'), s])
-  endforeach
-endif
-
-run_target('veristat_diff', command: [run_veristat_diff, meson.current_build_dir(),
-                                 get_option('veristat_scheduler'), get_option('kernel'),
-                                 get_option('veristat_diff_dir')])
-
-if enable_stress
-  # not sure there's a better way
-  # only different...
-  copys = [
-    custom_target('copy stress wrapper',
-      input : 'scripts/bpftrace_stress_wrapper.sh',
-      output :  'bpftrace_stress_wrapper.sh',
-      command : ['cp', '-a', '@INPUT@', '@OUTPUT@'],
-      install : false,
-      build_by_default : true),
-     custom_target('copy dsq_lat',
-      input : 'scripts/dsq_lat.bt',
-      output :  'dsq_lat.bt',
-      command : ['cp', '-a', '@INPUT@', '@OUTPUT@'],
-      install : false,
-      build_by_default : true),
-      custom_target('copy runq_lat',
-        input : 'scripts/process_runqlat.bt',
-        output :  'process_runqlat.bt',
-        command : ['cp', '-a', '@INPUT@', '@OUTPUT@'],
-        install : false,
-        build_by_default : true)
-    ]
-  run_target('stress_tests', command: [run_stress_tests, '-k', kernel, '-b',
-                                       meson.current_build_dir()], depends: [copys])
-
-  if get_option('vng_rw_mount') == true
-      foreach s : rust_scheds
-      if get_option('kernel_headers') == ''
-        run_target('stress_tests_'+s, command: [run_stress_tests, '-k', kernel,
-                                                '-b', meson.current_build_dir(), '--sched', s,
-                                                '--rw', 'true',
-                                                '--extra-scheduler-args', get_option('extra_sched_args')],
-                                                depends: [copys])
-      else
-        run_target('stress_tests_'+s, command: [run_stress_tests, '-k', kernel,
-                                                '-b', meson.current_build_dir(), '--sched', s,
-                                                '--rw', 'true', 
-                                                '--headers', get_option('kernel_headers'),
-                                                '--extra-scheduler-args', get_option('extra_sched_args')],
-                                                depends: [copys])
-      endif
-      endforeach
-  else
-      foreach s : rust_scheds
-        if get_option('kernel_headers') == ''
-          run_target('stress_tests_'+s, command: [run_stress_tests, '-k', kernel, 
-                                              '-b', meson.current_build_dir(), '--sched', s,
-                                              '--extra-scheduler-args', get_option('extra_sched_args')],
-                                              depends: [copys])
-        else
-          run_target('stress_tests_'+s, command: [run_stress_tests, '-k', kernel, 
-                                              '-b', meson.current_build_dir(), '--sched', s,
-                                              '--headers', get_option('kernel_headers'),
-                                              '--extra-scheduler-args', get_option('extra_sched_args')],
-                                              depends: [copys])
-        endif
-      endforeach
-  endif
-endif
-
 thread_dep = dependency('threads')
 
 subdir('scheds')
-
-systemd = dependency('systemd', required: get_option('systemd'))
-
-if systemd.found()
-  subdir('services/systemd')
-endif
-
-openrc = dependency('openrc', required: get_option('openrc'))
-
-if openrc.found()
-  subdir('services/openrc')
-endif
-
-libalpm = dependency('libalpm', required: get_option('libalpm'))
-
-if libalpm.found() and systemd.found()
-  subdir('libalpm/systemd')
-endif
-
-if libalpm.found() and openrc.found()
-  subdir('libalpm/openrc')
-endif
