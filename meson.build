@@ -18,8 +18,6 @@ get_bpftool_ver = find_program(join_paths(meson.current_source_dir(),
                                           'meson-scripts/get_bpftool_ver'))
 bpftool_build_skel = find_program(join_paths(meson.current_source_dir(),
                                              'meson-scripts/bpftool_build_skel'))
-bpftool_build_skel_lib = find_program(join_paths(meson.current_source_dir(),
-                                             'meson-scripts/bpftool_build_skel_lib'))
 get_sys_incls = find_program(join_paths(meson.current_source_dir(),
                                         'meson-scripts/get_sys_incls'))
 fetch_libbpf = find_program(join_paths(meson.current_source_dir(),
@@ -30,10 +28,6 @@ fetch_bpftool = find_program(join_paths(meson.current_source_dir(),
                                       'meson-scripts/fetch_bpftool'))
 build_bpftool = find_program(join_paths(meson.current_source_dir(),
                                       'meson-scripts/build_bpftool'))
-scx_lib_name = 'lib'
-scx_lib_path = join_paths(meson.current_build_dir(), 'lib/', scx_lib_name)
-compile_scx_lib = find_program(join_paths(meson.current_source_dir(),
-                                      'meson-scripts/compile_scx_lib'))
 
 
 bpf_clang_ver = run_command(get_clang_ver, bpf_clang, check: true).stdout().strip()
@@ -261,14 +255,6 @@ user_c_dep = [declare_dependency(
   include_directories: include_directories('scheds/include'),
 )]
 
-scx_test_c_args = ['-DTEST', '-Wno-attributes', '-Wno-unknown-pragmas']
-
-lib_objs = []
-subdir('lib')
-
-scx_test_dep = [declare_dependency(
-  dependencies: [libbpf_dep, kernel_dep, user_c_dep, scx_lib_test_dep, scxtest_dep])]
-
 #
 # Generators to build BPF skel file for C schedulers.
 #
@@ -282,11 +268,6 @@ gen_bpf_skel = generator(bpftool_build_skel,
                          output: ['@BASENAME@.skel.h','@BASENAME@.subskel.h' ],
                          depends: [libbpf, bpftool_target],
                          arguments: [bpftool_exe_path, '@INPUT@', '@OUTPUT0@', '@OUTPUT1@'])
-
-gen_bpf_skel_lib = generator(bpftool_build_skel_lib,
-                         output: ['@BASENAME@.skel.h','@BASENAME@.subskel.h' ],
-                         depends: [libbpf, bpftool_target, scx_lib],
-                         arguments: [bpftool_exe_path, '@INPUT@', '@OUTPUT0@', '@OUTPUT1@', scx_lib_path])
 
 thread_dep = dependency('threads')
 
