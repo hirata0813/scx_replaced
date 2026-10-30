@@ -1,27 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Hybrid sched_ext スケジューラ – ユーザー空間ローダー
- *
- * 使い方:
- *   sudo ./scx_hybridv2 [--preemption-ns <ns>] [--stats-interval <sec>]
- *
- * オプション:
- *   --preemption-ns <ns>      プリエンプション・タイムスライス (ナノ秒)
- *                             デフォルト: 50000 (50 µs, ghOSt デフォルトと同値)
- *   --stats-interval <sec>   統計を表示する間隔 (秒)。0 で無効。デフォルト: 1
- *
- * ビルド (scx リポジトリの meson/cmake 環境でなく単独の場合):
- *   # BPF オブジェクトを先にビルドしておく
- *   clang -O2 -g -target bpf \
- *     -I /usr/include/x86_64-linux-gnu \
- *     -c scx_hybridv2.bpf.c -o scx_hybridv2.bpf.o
- *   bpftool gen skeleton scx_hybridv2.bpf.o > scx_hybridv2.skel.h
- *
- *   # ユーザー空間ローダーをビルド
- *   gcc -O2 -Wall -o scx_hybridv2 scx_hybridv2.c \
- *     -lbpf -lelf -lz
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -38,7 +14,6 @@
 #include <scx/common.h>
 #include <sys/stat.h>
 
-/* BPF スケルトン (bpftool gen skeleton で生成) */
 #include "scx_extended.bpf.skel.h"
 
 /* Map をピンするディレクトリ */
@@ -55,7 +30,7 @@ static void sig_handler(int sig)
 }
 
 /* ------------------------------------------------------------------ */
-/* 統計インデックス (BPF 側と一致させる)                               */
+/* 統計インデックス                                                   */
 /* ------------------------------------------------------------------ */
 enum stat_idx {
     STAT_FIFO_ENQUEUE   = 0,
@@ -99,51 +74,23 @@ static void print_stats(struct scx_extended *skel)
 }
 
 /* ------------------------------------------------------------------ */
-/* CPU ポリシーの設定                                                   */
+/* CPU ポリシ設定                                                     */
 /* ------------------------------------------------------------------ */
 
 enum cpu_policy {
-    CPU_POLICY_UNSET = 0,  /* 未設定 = デフォルト値。明示的にセットされていない場合と区別するため */
+    CPU_POLICY_UNSET = 0,
     CPU_POLICY_FIFO  = 1,
     CPU_POLICY_CFS   = 2,
 };
 
 /*
- * cpu_policy_map (BPF_MAP_TYPE_ARRAY) に書き込める CPU 数の上限。
- * BPF 側 (scx_extended_bpf.c) の cpu_policy_map の max_entries と一致させること。
- * 現状 64 なので、50 個ほどの CPU を fifo/cfs 用途で管理するのに十分な余裕がある。
+ * cpu_policy_map (BPF_MAP_TYPE_ARRAY) に書き込める CPU 数の上限
+ * BPF 側 (scx_extended_bpf.c) の cpu_policy_map の max_entries と一致させる
  */
 #define CPU_POLICY_MAP_CAPACITY 64
 
-/*
- * fifo/cfs のどちらにも割り当てられた CPU を記録しておくための表。
- * fifo と cfs 両方の呼び出しをまたいで重複チェックするため、
- * ファイルスコープ (static) で保持する。
- * 値は CPU_POLICY_UNSET / CPU_POLICY_FIFO / CPU_POLICY_CFS のいずれか。
- */
 static uint32_t g_cpu_assignment[CPU_POLICY_MAP_CAPACITY];
 
-/*
- * "0,1,3" のようなカンマ区切りに加えて、"1-10" のような範囲指定にも対応した
- * CPU リストをパースし、cpu_policy_map の該当 CPU エントリに policy を書き込む。
- *
- * 対応フォーマット例:
- *   "0,1,3"        単純なカンマ区切り
- *   "1-10"         範囲指定 (1,2,...,10 を意味する)
- *   "0,2,5-10,12"  カンマ区切りと範囲指定の混在
- *
- * fifo/cfs どちらにも指定されなかった CPU は cpu_policy_map に一切書き込まれず、
- * BPF 側で zero 初期化されたまま (CPU_POLICY_UNSET) となる。
- * BPF 側 (extended_select_cpu / extended_enqueue) は、tctx が無い、または
- * nr_cpus_allowed == 1 のタスクをデフォルトの CPU 選択・SCX_DSQ_LOCAL に
- * フォールバックさせるため、そのような CPU 上で taskset 等により固定実行される
- * ワークロード起動スクリプト等は通常通りのスケジューリングを受けられる。
- *
- * 呼び出しタイミングの注意:
- *   skel_load() の後、attach() の前に呼ぶこと。
- *   (ops.init が attach 時に呼ばれるため、それより前に
- *    map の中身を確定させておく必要がある)
- */
 static int parse_cpu_list_and_set_policy(struct bpf_map *map,
                                           const char *cpu_list_str,
                                           uint32_t policy)
@@ -168,7 +115,6 @@ static int parse_cpu_list_and_set_policy(struct bpf_map *map,
         return fd;
     }
 
-    /* map の実際の max_entries を尋ね、決め打ちのマクロとズレていないか確認する */
     map_capacity = (int)bpf_map__max_entries(map);
     if (map_capacity <= 0 || map_capacity > CPU_POLICY_MAP_CAPACITY)
         map_capacity = CPU_POLICY_MAP_CAPACITY;
@@ -184,12 +130,10 @@ static int parse_cpu_list_and_set_policy(struct bpf_map *map,
 
         errno = 0;
         if (dash) {
-            /* "start-end" 形式の範囲指定 */
             *dash = '\0';
             start = strtol(token, NULL, 10);
             end   = strtol(dash + 1, NULL, 10);
         } else {
-            /* 単一の CPU 番号 */
             start = end = strtol(token, NULL, 10);
         }
 
@@ -245,9 +189,7 @@ static int parse_cpu_list_and_set_policy(struct bpf_map *map,
 }
 
 /*
- * fifo/cfs いずれにも割り当てられなかった CPU (= 通常通りの挙動をする CPU) の
- * 一覧を表示する。ワークロード起動スクリプト等を taskset -c で固定して
- * 実行したい CPU がここに含まれているか、起動時に目視確認できるようにする。
+ * fifo/cfs いずれにも割り当てられなかった CPU (= 通常通りの挙動をする CPU) の一覧を表示．
  */
 static void print_cpu_assignment_summary(int map_capacity)
 {
@@ -268,7 +210,7 @@ static void print_cpu_assignment_summary(int map_capacity)
 }
 
 /* ------------------------------------------------------------------ */
-/* main                                                                 */
+/* main                                                               */
 /* ------------------------------------------------------------------ */
 static void usage(const char *prog)
 {
@@ -299,7 +241,6 @@ int main(int argc, char *argv[])
 {
     struct scx_extended *skel;
     struct bpf_link        *link = NULL;
-    //uint64_t preemption_ns   = 50000ULL; /* 50 µs */
     uint64_t preemption_ns   = 10000000ULL; /* 10 ms */
     int      stats_interval  = 1;
     int      ret             = 0;
@@ -344,7 +285,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---- CPU ポリシー引数の必須チェック ---- */
+    /* ---- CPU ポリシ引数の必須チェック ---- */
     if (!fifo_cpus || !cfs_cpus) {
         fprintf(stderr, "Error: --fifo-cpus and --cfs-cpus are both required.\n\n");
         usage(argv[0]);
@@ -388,7 +329,7 @@ int main(int argc, char *argv[])
     /* ---- ロード ---- */
     SCX_OPS_LOAD(skel, extended_ops, scx_extended, uei);
 
-    /* ---- CPU ポリシー map への書き込み (load後、attach前) ---- */
+    /* ---- cpu_policy_map への書き込み ---- */
     if (parse_cpu_list_and_set_policy(skel->maps.cpu_policy_map,
                                        fifo_cpus, CPU_POLICY_FIFO)) {
         fprintf(stderr, "Failed to set FIFO cpu policy\n");

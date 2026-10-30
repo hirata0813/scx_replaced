@@ -3,26 +3,12 @@
  * Replaced sched_ext Scheduler
  *
  * ロジック:
- *   - タスクはまず、FIFO DSQ (全 CPU で共通のカスタム DSQ) に入る。
- *   - FIFO DSQ 上のタスクは preemption_slice_ns ナノ秒間だけ実行される。
- *   - FIFO において，タイムスライスを使い切る前に終了(他タスクの割り込みや自発的スリープ)したタスクは再び FIFO に戻る。
- *   - タイムスライスを使い切って終了した(slice == 0 で stopping)タスクは，CFS ポリシ(CPU ごとに持つカスタム CFS DSQ) に格上げされ、以降は vtime ベースで
- *     スケジューリングされる。
+ *   - タスクはまず，FIFO DSQ (全 CPU で共通のカスタム DSQ) に入る．
+ *   - FIFO DSQ 上のタスクは preemption_slice_ns ナノ秒間だけ実行される．
+ *   - FIFO において，タイムスライスを使い切る前に終了(他タスクの割り込みや自発的スリープ)したタスクは再び FIFO に戻る．
+ *   - タイムスライスを使い切って終了した(slice == 0 で stopping)タスクは，CFS ポリシ(CPU ごとに持つカスタム CFS DSQ) に移行し，以降は vtime ベースで
+ *     スケジューリングされる．
  *
- * ghOSt 実装との対応:
- *   ghOSt HybridScheduler    →  この BPF スケジューラ
- *   ShortQueueRq (FIFO)      →  FIFO_DSQ  (全 CPU で共通のカスタム DSQ)
- *   CfsRq (vtime)            →  CFS_DSQ   (CPU ごとに持つカスタム CFS DSQ)
- *   preemption_time_slice_   →  preemption_slice_ns (ロDATA マップ経由で設定可)
- *   task->new_to_cfs         →  task_ctx->promoted (CFS へ昇格済みフラグ)
- *
- * ビルド方法 (scx リポジトリ構成を想定):
- *   clang -O2 -g -target bpf \
- *     -I /path/to/linux/tools/include \
- *     -I /path/to/scx/scheds/include \
- *     -c hybrid_scx.bpf.c -o hybrid_scx.bpf.o
- *
- * ユーザー空間ローダーは hybrid_scx.c を参照。
  */
 
 #include "vmlinux.h"
@@ -40,27 +26,27 @@ UEI_DEFINE(uei);
  * 0x1_00000001
  *   ↑ ↑
  *   |  └─ 下位32bit = 0x00000001 = 1  (CPU番号)
- *   └──── 33bit目    = 1              (DSQ種別マーカー、1ULL<<32)
+ *   └──── 33bit目    = 1              (DSQ種別マーカ、1ULL<<32)
  */
 #define CFS_DSQ(cpu)   ((u64)(cpu) | (1ULL << 32))
 #define GLOBAL_FIFO_DSQ 0x0ffffffff // 33bit目は0(FIFO のマーカ)，下位32bitは全て立てて，CPU番号と被らないようにしておく
-#define GLOBAL_CFS_DSQ 0x1ffffffff // --global-cfs 指定時に使う，CPU に紐付かない単一の CFS DSQ．33bit目は0(FIFO のマーカ)，下位32bitは全て立てて，CPU番号と被らないようにしておく
+#define GLOBAL_CFS_DSQ 0x1ffffffff // --global-cfs 指定時に使う，CPU に紐付かない単一の CFS DSQ．33bit目は1(FIFO のマーカ)，下位32bitは全て立てて，CPU番号と被らないようにしておく
 
 #define CFS_SCHED_SLICE_NS  10000000ULL
 /* ------------------------------------------------------------------ */
-/* 設定 (ユーザー空間から BPF_MAP_TYPE_ARRAY で書き換え可能)           */
+/* 設定 (ユーザ空間から BPF_MAP_TYPE_ARRAY で書き換え可能)            */
 /* ------------------------------------------------------------------ */
-/* デフォルトのプリエンプション・タイムスライス: 50 µs (ghOSt デフォルトと同じ) */
+/* デフォルトのプリエンプション・タイムスライス: 50 µs */
 const volatile u64 preemption_slice_ns = 50000ULL;
 
 /*
- * true の場合、CFS フェーズは CPU ごとの CFS_DSQ(cpu) ではなく、
- * 全 CFS CPU で共有する単一の GLOBAL_CFS_DSQ を使う。
- * (--global-cfs オプションでユーザー空間から設定)
+ * true の場合，CFS フェーズは CPU ごとの CFS_DSQ(cpu) ではなく，
+ * 全 CFS CPU で共有する単一の GLOBAL_CFS_DSQ を使う．
+ * (--global-cfs オプションでユーザ空間から設定)
  */
 const volatile bool global_cfs = false;
 /* ------------------------------------------------------------------ */
-/* タスクごとのコンテキスト                                             */
+/* タスクごとのコンテキスト                                           */
 /* ------------------------------------------------------------------ */
 struct task_ctx {
     /*
@@ -71,12 +57,12 @@ struct task_ctx {
 
     /*
      * このタスクが CFS フェーズに入った際の，CPU 累積実行時間(ns)
-     * running() コールバックで記録し、stopping() で経過を計算する。
+     * running() コールバックで記録し，stopping() で経過を計算する．
      */
     u64 cfs_start_runtime_ns;
 
     /* CFS フェーズでの仮想時間 (vtime)
-     * vtime は，タスクがこれまでに，実際に CPU を掴んで実行された累積時間．小さいほど「CPU をあまり使ってないので優先して実行すべき」という意味
+     * vtime は，タスクがこれまでに実際に CPU を掴んで実行された累積時間．小さいほど「CPU をあまり使ってないので優先して実行すべき」という意味
      * CFS DSQ にエンキューする際は，都度，vtime の値で DSQ 内のタスクが並べ替えられる
      */
     u64 vtime;
@@ -85,11 +71,6 @@ struct task_ctx {
      * マイグレーションが発生した際，vtime を適切な値に更新できるようにするため
      */
     s32 last_cpu;
-
-    /* CFS フェーズで，前回実行していた CPU を記録する
-     * マイグレーションが発生した際，vtime を適切な値に更新できるようにするため
-     */
-    
 
     u64 tasknew;
     u64 firstrun;
@@ -108,7 +89,7 @@ struct {
 } task_ctx_stor SEC(".maps");
 
 /* ------------------------------------------------------------------ */
-/* 各タスクのメトリクスを保持する BPF Map                                  */
+/* 各タスクのメトリクスを保持する BPF Map                             */
 /* ------------------------------------------------------------------ */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -139,22 +120,22 @@ struct {
 } taskdead_map SEC(".maps");
 
 /* ------------------------------------------------------------------ */
-/* CPU の割当ポリシを管理する Map・関数                                    */
+/* CPU の割当ポリシを管理する Map・関数                               */
 /* ------------------------------------------------------------------ */
 enum cpu_policy {
-    CPU_POLICY_UNSET = 0,  /* 未設定 = デフォルト値。明示的にセットされていない場合と区別するため */
+    CPU_POLICY_UNSET = 0,  /* 未設定 */
     CPU_POLICY_FIFO  = 1,
     CPU_POLICY_CFS   = 2,
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 64); /* 50 個程度の CPU を管理できるよう余裕を持たせる */
+    __uint(max_entries, 64);
     __type(key, u32);
     __type(value, u32);
 } cpu_policy_map SEC(".maps");
 
-// 各ポリシごとに「最後に選んだCPU」を記憶する．これは，あるポリシに対応する CPU を探す際，どれも busy だった場合に，フォールバックとして選ぶ CPU を固定させないため      */
+// 各ポリシごとに「最後に選んだCPU」を記憶する．これは，あるポリシに対応する CPU を探す際，どれも busy だった場合に，フォールバックとして選ぶ CPU を固定させないため
 enum rr_idx {
     RR_IDX_FIFO = 0,
     RR_IDX_CFS  = 1,
@@ -183,7 +164,7 @@ static s32 pick_cpu_by_policy(u32 target_policy, u32 rr_idx)
     last  = bpf_map_lookup_elem(&rr_last_cpu_map, &rr_idx);
     start = last ? ((*last + 1) % nr_cpus) : 0;
 
-    /* 前回選んだ「次」から該当ポリシの CPU を探しつつ、
+    /* 前回選んだ「次」から該当ポリシの CPU を探しつつ，
      * アイドルなら即採用，busy なら最初の1件を fallback として記憶
      * このようにする理由は，該当ポリシの CPU が全て busy な場合に，フォールバックとして選ばれるものを固定化させないため
      */
@@ -217,7 +198,7 @@ static s32 pick_cpu_by_policy(u32 target_policy, u32 rr_idx)
     /* 全部busyだった場合、最初に見つかったCPUをfallbackとして採用 */
     u32 val = (u32)fallback_cpu;
     bpf_map_update_elem(&rr_last_cpu_map, &rr_idx, &val, BPF_ANY);
-   
+
     return fallback_cpu;
 }
 
@@ -303,12 +284,12 @@ static __always_inline void stat_inc(enum stat_idx idx)
 }
 
 /* ------------------------------------------------------------------ */
-/* vtime ユーティリティ                                                 */
+/* vtime ユーティリティ                                               */
 /* ------------------------------------------------------------------ */
 
 /*
- * vtime が前にあるか判定 (符号付き比較でラップアラウンドに対応)。
- * Linux カーネルの time_before64() と同じ慣用句。
+ * vtime が前にあるか判定 (符号付き比較でラップアラウンドに対応)．
+ * Linux カーネルの time_before64() と同じ．
  */
 static __always_inline bool vtime_before(u64 a, u64 b)
 {
@@ -342,9 +323,9 @@ static __always_inline void update_vtime_now(s32 cpu, u64 vtime)
 }
 
 /*
- * --global-cfs モード用の、CPU に紐付かない単一の vtime_now
- * 実在の CPU 番号と衝突しないよう、専用の 1 要素 Map として分離
- * (プレーンな BPF グローバル変数ではなく Map にしているのは、
+ * --global-cfs モード用の，CPU に紐付かない単一の vtime_now
+ * 実在の CPU 番号と衝突しないよう，専用の 1 要素 Map として分離
+ * (プレーンな BPF グローバル変数ではなく Map にしているのは，
  *  他の vtime_now と同じアクセス経路に統一するため)
  */
 struct {
@@ -369,34 +350,12 @@ static __always_inline void update_global_vtime_now(u64 vtime)
         *val = vtime;
 }
 
-static __always_inline void print_vtime_now()
-{
-    u32 key0 = 0;
-    u32 key1 = 1;
-    u32 key2 = 2;
-    u32 key3 = 3;
-    u64 *vtime0;
-    u64 *vtime1;
-    u64 *vtime2;
-    u64 *vtime3;
-
-    vtime0 = bpf_map_lookup_elem(&vtime_now_map, &key0);
-    vtime1 = bpf_map_lookup_elem(&vtime_now_map, &key1);
-    vtime2 = bpf_map_lookup_elem(&vtime_now_map, &key2);
-    vtime3 = bpf_map_lookup_elem(&vtime_now_map, &key3);
-    
-    if(vtime0 && vtime1 && vtime2 && vtime3){
-        //bpf_printk("vtime_now: CPU0:%llu, CPU1:%llu, CPU2:%llu, CPU3:%llu", *vtime0, *vtime1, *vtime2, *vtime3);
-    }
-}
-
 /* ------------------------------------------------------------------ */
-/* ops.select_cpu                                                       */
+/* ops.select_cpu                                                     */
 /* ------------------------------------------------------------------ */
 /*
- * デフォルト CPU 選択を使い、アイドル CPU が見つかれば即 SCX_DSQ_LOCAL
- * にディスパッチして enqueue() をスキップする。
- * ghOSt における ShortQueueSchedule() の CPU 空き確認に相当。
+ * デフォルト CPU 選択を使い，アイドル CPU が見つかれば SCX_DSQ_LOCAL
+ * にディスパッチして enqueue() をスキップ．
  */
 s32 BPF_STRUCT_OPS(replaced_select_cpu, struct task_struct *p,
                    s32 prev_cpu, u64 wake_flags)
@@ -411,31 +370,22 @@ s32 BPF_STRUCT_OPS(replaced_select_cpu, struct task_struct *p,
         /* フォールバック: デフォルトの CPU 選択アルゴリズムに任せる */
         cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
         if (is_idle) {
-                    //bpf_printk("select_cpu(): fallback: inserting: pid:%d, comm:%s, scx.slice:%llu", p->pid, p->comm, p->scx.slice);
 		    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 	    }
-        //bpf_printk("select_cpu(): fallback: pid:%d, comm:%s, scx.slice:%llu", p->pid, p->comm, p->scx.slice);
         return cpu;
     }
-
-    //bpf_printk("select_cpu(): pid:%d, comm:%s, scx.slice:%llu", p->pid, p->comm, p->scx.slice);
 
     return prev_cpu;
 }
 
 /* ------------------------------------------------------------------ */
-/* ops.enqueue                                                          */
+/* ops.enqueue                                                        */
 /* ------------------------------------------------------------------ */
 /*
  * タスクを DSQ にエンキューする際に呼ばれる
  *
  * - promoted == false → グローバル FIFO DSQ にエンキュー (タイムスライス = preemption_slice_ns)
  * - promoted == true  → CFS が割り当てられた CPU を選び，その CPU に紐付いた CFS_DSQ  に vtime ベースでエンキュー
- *
- * ghOSt:
- *   TaskNew / TaskRunnable が short_queue_.Enqueue() を呼ぶパスに相当。
- *   TaskPreempted が時間超過を検出して TaskNewToCfs() を呼ぶパスは
- *   stopping() コールバック側で行う。
  */
 void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
 {
@@ -446,7 +396,6 @@ void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
     if (!tctx || p->nr_cpus_allowed == 1 ||
 	(!managed && !bpf_cpumask_test_cpu(30, p->cpus_ptr))) {
         /* フォールバック: デフォルトの CPU 選択アルゴリズムに任せる */
-        //bpf_printk("enqueue(): fallback: pid:%d, comm:%s, scx.slice:%llu, allow:%d", p->pid, p->comm, p->scx.slice, p->nr_cpus_allowed);
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
         return;
     }
@@ -454,7 +403,6 @@ void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
     // 管理対象でないタスクは別 CPU で実行
     if (!managed) {
         s32 cpu = 30;
-        //bpf_printk("enqueue(): generator: pid:%d, comm:%s, cpu:%d", p->pid, p->comm, cpu);
 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
 	return;
     }
@@ -462,20 +410,17 @@ void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
     if (!tctx->is_enqueue_passed) {
 	tctx->is_enqueue_passed = 1;
         tctx->tasknew = bpf_ktime_get_ns();   // 意図通り CPU が選ばれたときを tasknew とする
-        //bpf_printk("enqueue(): tasknew stamped: pid:%d, comm:%s", p->pid, p->comm);
     }
 
     if (!tctx->promoted) {
         /* FIFO フェーズ */
         stat_inc(STAT_FIFO_ENQUEUE);
-        //bpf_printk("enqueue(): FIFO: pid:%d, comm:%s, scx.slice:%llu, allow:%d", p->pid, p->comm, p->scx.slice, p->nr_cpus_allowed);
 
         /*
          * 関連研究では，FIFO キューはグローバルキューとして実装していたため，本実装もそのようにする
          */
         scx_bpf_dsq_insert(p, GLOBAL_FIFO_DSQ, preemption_slice_ns, enq_flags);
     } else {
-        //bpf_printk("enqueue(): CFS: pid:%d, comm:%s, scx.slice:%llu, allow:%d", p->pid, p->comm, p->scx.slice, p->nr_cpus_allowed);
         /* CFS フェーズ: vtime ベース */
 
         /* CFS フェーズでは，vtime の小さい順にスケジューリングされる
@@ -487,10 +432,10 @@ void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
 
         if (global_cfs) {
             /*
-             * --global-cfs: 全 CFS CPU で共有する単一 DSQ を使うため、
-             * どの CPU が実際に実行するかを事前に選ぶ必要はない。
-             * vtime の基準も単一の global_vtime_now_map を使うので、
-             * CPU マイグレーションによる vtime 変換も不要になる。
+             * --global-cfs: 全 CFS CPU で共有する単一 DSQ を使うため，
+             * どの CPU が実際に実行するかを事前に選ぶ必要はない．
+             * vtime の基準も単一の global_vtime_now_map を使うので，
+             * CPU マイグレーションによる vtime 変換も不要になる．
              */
             dsq_id = GLOBAL_CFS_DSQ;
             vtime_now = get_global_vtime_now();
@@ -504,8 +449,6 @@ void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
             if (tctx->last_cpu >= 0 && tctx->last_cpu != cfs_cpu) {
                 u64 old_now = get_vtime_now(tctx->last_cpu);
                 // 旧 CPU での「相対的な位置」を新 CPU に移植する
-                // relative = vtime - old_now  (負なら末尾より前、正なら末尾より後)
-                // new_vtime = vtime_now + relative
                 if (old_now > 0) {
                     s64 relative = (s64)(vtime - old_now);
                     vtime = (u64)((s64)vtime_now + relative);
@@ -536,16 +479,13 @@ void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 /* ------------------------------------------------------------------ */
-/* ops.dispatch                                                         */
+/* ops.dispatch                                                       */
 /* ------------------------------------------------------------------ */
 /*
- * CPU が実行するタスクを探す際に呼ばれる。
+ * CPU が実行するタスクを探す際に呼ばれる．
  * このハンドラは，CPU のローカル DSQ，グローバル DSQ 両方が空の際に呼ばれる．
  * このスケジューラでは，基本的には，ローカルとグローバルのどちらにも直接エンキューしないため，このハンドラは定期的に呼び出される想定．
  * ハンドラを呼び出した CPU に割当たっている ポリシを判定し，それに対応するカスタム DSQ から，CPU のローカルキューへタスクを move する．
- *
- * ghOSt ShortQueueSchedule() における short_queue_ 優先、
- * 次に long_cpulist 上の CFS という順序と対応する。
  */
 void BPF_STRUCT_OPS(replaced_dispatch, s32 cpu, struct task_struct *prev)
 {
@@ -556,8 +496,8 @@ void BPF_STRUCT_OPS(replaced_dispatch, s32 cpu, struct task_struct *prev)
         scx_bpf_dsq_move_to_local(GLOBAL_FIFO_DSQ);
     }else if(is_cfs_cpu(cpu)){
         /*
-         * ハンドラを呼び出した CPU が CFS 対応の場合、
-         * --global-cfs なら全 CFS CPU 共有の GLOBAL_CFS_DSQ から、
+         * ハンドラを呼び出した CPU が CFS 対応の場合，
+         * --global-cfs なら全 CFS CPU 共有の GLOBAL_CFS_DSQ から，
          * そうでなければ自分専用の CFS_DSQ(cpu) からタスクを移動する
          */
         u64 dsq_id = global_cfs ? GLOBAL_CFS_DSQ : CFS_DSQ(cpu);
@@ -566,21 +506,16 @@ void BPF_STRUCT_OPS(replaced_dispatch, s32 cpu, struct task_struct *prev)
 }
 
 /* ------------------------------------------------------------------ */
-/* ops.running                                                          */
+/* ops.running                                                        */
 /* ------------------------------------------------------------------ */
 /*
- * タスクが CPU 上で実際に実行を開始した直後に呼ばれる
- * FIFO フェーズでは，特に何もしない
- * CFS フェーズでは，スライス開始時点での CPU 累積実行時間を記録し，vtime_now を最新化
- *
- * ghOSt TaskOnCpu() に相当。
+ * タスクが CPU 上で実際に実行を開始した直後に呼ばれる．
+ * FIFO フェーズでは，特に何もしない．
+ * CFS フェーズでは，スライス開始時点での CPU 累積実行時間を記録し，vtime_now を最新化．
  */
 void BPF_STRUCT_OPS(replaced_running, struct task_struct *p)
 {
     struct task_ctx *tctx;
-
-    s32 cpu2 = bpf_get_smp_processor_id();
-    //cpu = pick_other_cpu();
 
     tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 
@@ -591,7 +526,6 @@ void BPF_STRUCT_OPS(replaced_running, struct task_struct *p)
 
     // 管理対象外のタスクは特に何もしない
     if (!is_managed_task(p)) {
-        //bpf_printk("running(): generator: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, allow:%d", p->pid, p->comm, cpu2, p->scx.slice, p->nr_cpus_allowed);
 	return;
     }
 
@@ -599,14 +533,12 @@ void BPF_STRUCT_OPS(replaced_running, struct task_struct *p)
     if (tctx->is_enqueue_passed == 1 && !tctx->is_firstrun_logged && tctx->tasknew > 0){
         tctx->firstrun               = bpf_ktime_get_ns();
         tctx->is_firstrun_logged = 1;
-        //bpf_printk("running(): firstrun stamped: pid:%d, comm:%s", p->pid, p->comm);
     }
 
 
     if (!tctx->promoted) {
         /* FIFO フェーズ: 特にやることはなし*/
     } else {
-        //bpf_printk("running(): CFS: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, pass:%d, allow:%d", p->pid, p->comm, cpu2, p->scx.slice, tctx->is_enqueue_passed, p->nr_cpus_allowed);
         /* CFS フェーズ: スライス開始時点での CPU 累積実行時間を記録し，vtime_now を最新化
          *              CPU 累積実行時間を記録するのは，stopping() で，そのスライスでの CPU 利用時間を計算し，タスクの vtime を更新するため
          */
@@ -629,18 +561,12 @@ void BPF_STRUCT_OPS(replaced_running, struct task_struct *p)
 }
 
 /* ------------------------------------------------------------------ */
-/* ops.stopping                                                         */
+/* ops.stopping                                                       */
 /* ------------------------------------------------------------------ */
 /*
- * タスクが CPU を離れる直前 (まだ実行終了していない場合も) に呼ばれる。
+ * タスクが CPU を離れる直前 (まだ実行終了していない場合も) に呼ばれる．
  *
- * ここでタイムスライス超過を判定し、超過していれば CFS フェーズへ昇格させる。
- *
- * ghOSt TaskPreempted() 内の
- *   "if (elapsed_runtime >= preemption_time_slice_) → TaskNewToCfs()"
- * に相当する。
- *
- * @runnable: true であればタスクはまだ実行可能 (スライス切れ等でプリエンプト)
+ * ここでタイムスライス超過を判定し、超過していれば CFS フェーズへ昇格させる．
  */
 void BPF_STRUCT_OPS(replaced_stopping, struct task_struct *p, bool runnable)
 {
@@ -655,17 +581,12 @@ void BPF_STRUCT_OPS(replaced_stopping, struct task_struct *p, bool runnable)
 
     // 管理対象外のタスクは特に何もしない
     if (!is_managed_task(p)) {
-        //bpf_printk("stopping(): generator: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, runnable=%d, allow:%d", p->pid, p->comm, cpu2, p->scx.slice, runnable, p->nr_cpus_allowed);
 	return;
     }
 
-    s32 cpu2 = bpf_get_smp_processor_id();
-
     if (tctx->promoted) {
-        //bpf_printk("stopping(): CFS: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, pass:%d, allow:%d", p->pid, p->comm, cpu2, p->scx.slice, tctx->is_enqueue_passed, p->nr_cpus_allowed);
         /*
-         * CFS フェーズ: 実際に消費した CPU 時間を vtime に反映。
-         * nice 値対応が必要なら inverse_weight を掛け算する。
+         * CFS フェーズ: 実際に消費した CPU 時間を vtime に反映．
          */
         u64 used = p->se.sum_exec_runtime - tctx->cfs_start_runtime_ns; // このスライスでの CFS 実行で，CPU をどの程度掴んで動いたのかを計算
                                                                         // つまり，p->se.sum_exec_runtime から，タスク実行開始時点での CPU 累積実行時間を，引く必要がある
@@ -704,7 +625,6 @@ void BPF_STRUCT_OPS(replaced_stopping, struct task_struct *p, bool runnable)
     //bpf_printk("stopping(): FIFO: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, runnable:%d", p->pid, p->comm, cpu2, p->scx.slice, runnable);
     if (runnable && p->scx.slice == 0 && tctx->is_enqueue_passed == 1) {
         /* CFS フェーズへ昇格 */
-        //bpf_printk("stopping(): FIFO -> CFS: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, runnable:%d", p->pid, p->comm, cpu2, p->scx.slice, runnable);
         tctx->promoted = true;
         /*
          * 初回 vtime は0に設定 (enqueue()で，選択された CFS DSQ の vtime_now を基準にクランプされるため)
@@ -717,13 +637,11 @@ void BPF_STRUCT_OPS(replaced_stopping, struct task_struct *p, bool runnable)
 }
 
 /* ------------------------------------------------------------------ */
-/* ops.enable                                                           */
+/* ops.enable                                                         */
 /* ------------------------------------------------------------------ */
 /*
- * タスクが sched_ext の制御下に入ったときに呼ばれる。
- * task_ctx を初期化する。
- *
- * ghOSt TaskNew() に相当。
+ * タスクが sched_ext の制御下に入ったときに呼ばれる．
+ * task_ctx を初期化する．
  */
 void BPF_STRUCT_OPS(replaced_enable, struct task_struct *p)
 {
@@ -753,8 +671,8 @@ void BPF_STRUCT_OPS(replaced_enable, struct task_struct *p)
 /* ops.disable                                                        */
 /* ------------------------------------------------------------------ */
 /*
- * タスクが終了し，sched_ext の制御下が外れるときに呼ばれる。
- * タスクの終了時刻を記録する。
+ * タスクが終了し，sched_ext の制御下が外れるときに呼ばれる．
+ * タスクの終了時刻を記録する．
  */
 void BPF_STRUCT_OPS(replaced_disable, struct task_struct *p)
 {
@@ -772,15 +690,14 @@ void BPF_STRUCT_OPS(replaced_disable, struct task_struct *p)
         bpf_map_update_elem(&firstrun_map, &pid, &tctx->firstrun, BPF_ANY);
         bpf_map_update_elem(&real_firstrun_map, &pid, &tctx->real_firstrun, BPF_ANY);
         bpf_map_update_elem(&taskdead_map, &pid, &tctx->taskdead, BPF_ANY);
-	//bpf_printk("disable(): pid:%d, comm:%s, tasknew:%llu, firstrun:%llu, taskdead: %llu", p->pid, p->comm, tctx->tasknew, tctx->firstrun, tctx->taskdead);
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* ops.init                                                             */
+/* ops.init                                                           */
 /* ------------------------------------------------------------------ */
 /*
- * スケジューラ初期化。カスタム DSQ を作成する。
+ * スケジューラ初期化．カスタム DSQ を作成する．
  */
 s32 BPF_STRUCT_OPS_SLEEPABLE(replaced_init)
 {
@@ -811,7 +728,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(replaced_init)
 }
 
 /* ------------------------------------------------------------------ */
-/* ops.exit                                                             */
+/* ops.exit                                                           */
 /* ------------------------------------------------------------------ */
 void BPF_STRUCT_OPS(replaced_exit, struct scx_exit_info *ei)
 {
@@ -832,6 +749,5 @@ struct sched_ext_ops replaced_ops = {
     .disable    = (void *)replaced_disable,
     .init       = (void *)replaced_init,
     .exit       = (void *)replaced_exit,
-    //.flags      = SCX_OPS_SWITCH_PARTIAL,
     .name       = "replaced",
 };
