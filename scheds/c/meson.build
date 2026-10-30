@@ -1,4 +1,4 @@
-c_scheds = ['scx_hybrid', 'scx_hybridv2']
+c_scheds = ['scx_replaced', 'scx_extended']
 
 foreach sched: c_scheds
   bpf_o = gen_bpf_o.process(sched + '.bpf.c')

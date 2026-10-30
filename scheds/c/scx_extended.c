@@ -3,7 +3,7 @@
  * Hybrid sched_ext スケジューラ – ユーザー空間ローダー
  *
  * 使い方:
- *   sudo ./scx_hybrid [--preemption-ns <ns>] [--stats-interval <sec>]
+ *   sudo ./scx_hybridv2 [--preemption-ns <ns>] [--stats-interval <sec>]
  *
  * オプション:
  *   --preemption-ns <ns>      プリエンプション・タイムスライス (ナノ秒)
@@ -14,11 +14,11 @@
  *   # BPF オブジェクトを先にビルドしておく
  *   clang -O2 -g -target bpf \
  *     -I /usr/include/x86_64-linux-gnu \
- *     -c scx_hybrid.bpf.c -o scx_hybrid.bpf.o
- *   bpftool gen skeleton scx_hybrid.bpf.o > scx_hybrid.skel.h
+ *     -c scx_hybridv2.bpf.c -o scx_hybridv2.bpf.o
+ *   bpftool gen skeleton scx_hybridv2.bpf.o > scx_hybridv2.skel.h
  *
  *   # ユーザー空間ローダーをビルド
- *   gcc -O2 -Wall -o scx_hybrid scx_hybrid.c \
+ *   gcc -O2 -Wall -o scx_hybridv2 scx_hybridv2.c \
  *     -lbpf -lelf -lz
  */
 
@@ -39,10 +39,10 @@
 #include <sys/stat.h>
 
 /* BPF スケルトン (bpftool gen skeleton で生成) */
-#include "scx_hybrid.bpf.skel.h"
+#include "scx_extended.bpf.skel.h"
 
 /* Map をピンするディレクトリ */
-#define BPF_FS_HYBRID_DIR "/sys/fs/bpf/scx_hybrid"
+#define BPF_FS_EXTENDED_DIR "/sys/fs/bpf/scx_extended"
 /* ------------------------------------------------------------------ */
 /* グローバル変数                                                       */
 /* ------------------------------------------------------------------ */
@@ -77,7 +77,7 @@ static const char *stat_names[STAT_MAX] = {
 /* ------------------------------------------------------------------ */
 /* 統計表示                                                             */
 /* ------------------------------------------------------------------ */
-static void print_stats(struct scx_hybrid *skel)
+static void print_stats(struct scx_extended *skel)
 {
     int stats_fd = bpf_map__fd(skel->maps.stats);
     int nr_cpus  = libbpf_num_possible_cpus();
@@ -92,7 +92,7 @@ static void print_stats(struct scx_hybrid *skel)
         }
     }
 
-    printf("\n[scx_hybrid stats]\n");
+    printf("\n[scx_extended stats]\n");
     for (int i = 0; i < STAT_MAX; i++)
         printf("  %-20s : %lu\n", stat_names[i], totals[i]);
     fflush(stdout);
@@ -110,7 +110,7 @@ enum cpu_policy {
 
 /*
  * cpu_policy_map (BPF_MAP_TYPE_ARRAY) に書き込める CPU 数の上限。
- * BPF 側 (scx_hybrid_bpf.c) の cpu_policy_map の max_entries と一致させること。
+ * BPF 側 (scx_extended_bpf.c) の cpu_policy_map の max_entries と一致させること。
  * 現状 64 なので、50 個ほどの CPU を fifo/cfs 用途で管理するのに十分な余裕がある。
  */
 #define CPU_POLICY_MAP_CAPACITY 64
@@ -134,7 +134,7 @@ static uint32_t g_cpu_assignment[CPU_POLICY_MAP_CAPACITY];
  *
  * fifo/cfs どちらにも指定されなかった CPU は cpu_policy_map に一切書き込まれず、
  * BPF 側で zero 初期化されたまま (CPU_POLICY_UNSET) となる。
- * BPF 側 (hybrid_select_cpu / hybrid_enqueue) は、tctx が無い、または
+ * BPF 側 (extended_select_cpu / extended_enqueue) は、tctx が無い、または
  * nr_cpus_allowed == 1 のタスクをデフォルトの CPU 選択・SCX_DSQ_LOCAL に
  * フォールバックさせるため、そのような CPU 上で taskset 等により固定実行される
  * ワークロード起動スクリプト等は通常通りのスケジューリングを受けられる。
@@ -297,7 +297,7 @@ static void usage(const char *prog)
 
 int main(int argc, char *argv[])
 {
-    struct scx_hybrid *skel;
+    struct scx_extended *skel;
     struct bpf_link        *link = NULL;
     //uint64_t preemption_ns   = 50000ULL; /* 50 µs */
     uint64_t preemption_ns   = 10000000ULL; /* 10 ms */
@@ -359,34 +359,34 @@ int main(int argc, char *argv[])
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
     /* ---- 以前の Map を unlink ---- */
-    mkdir(BPF_FS_HYBRID_DIR, 0700);
-	unlink(BPF_FS_HYBRID_DIR "/_rodata_str1_1");
-	unlink(BPF_FS_HYBRID_DIR "/tasknew_map");
-	unlink(BPF_FS_HYBRID_DIR "/firstrun_map");
-	unlink(BPF_FS_HYBRID_DIR "/real_firstrun_map");
-	unlink(BPF_FS_HYBRID_DIR "/taskdead_map");
-	unlink(BPF_FS_HYBRID_DIR "/cpu_policy_map");
-	unlink(BPF_FS_HYBRID_DIR "/global_vtime_now_map");
-    unlink(BPF_FS_HYBRID_DIR "/vtime_now_map");
-    unlink(BPF_FS_HYBRID_DIR "/rr_last_cpu_map");
-    unlink(BPF_FS_HYBRID_DIR "/managed_pids");
-    unlink(BPF_FS_HYBRID_DIR "/task_ctx_stor");
-    unlink(BPF_FS_HYBRID_DIR "/stats");
-	unlink(BPF_FS_HYBRID_DIR "/_data_uei_dump");
-	unlink(BPF_FS_HYBRID_DIR "/hybrid_ops");
-	unlink(BPF_FS_HYBRID_DIR "/scx_hybr_bss");
-	unlink(BPF_FS_HYBRID_DIR "/scx_hybr_data");
-	unlink(BPF_FS_HYBRID_DIR "/scx_hybr_rodata");
+    mkdir(BPF_FS_EXTENDED_DIR, 0700);
+	unlink(BPF_FS_EXTENDED_DIR "/_rodata_str1_1");
+	unlink(BPF_FS_EXTENDED_DIR "/tasknew_map");
+	unlink(BPF_FS_EXTENDED_DIR "/firstrun_map");
+	unlink(BPF_FS_EXTENDED_DIR "/real_firstrun_map");
+	unlink(BPF_FS_EXTENDED_DIR "/taskdead_map");
+	unlink(BPF_FS_EXTENDED_DIR "/cpu_policy_map");
+	unlink(BPF_FS_EXTENDED_DIR "/global_vtime_now_map");
+    unlink(BPF_FS_EXTENDED_DIR "/vtime_now_map");
+    unlink(BPF_FS_EXTENDED_DIR "/rr_last_cpu_map");
+    unlink(BPF_FS_EXTENDED_DIR "/managed_pids");
+    unlink(BPF_FS_EXTENDED_DIR "/task_ctx_stor");
+    unlink(BPF_FS_EXTENDED_DIR "/stats");
+	unlink(BPF_FS_EXTENDED_DIR "/_data_uei_dump");
+	unlink(BPF_FS_EXTENDED_DIR "/extended_ops");
+	unlink(BPF_FS_EXTENDED_DIR "/scx_hybr_bss");
+	unlink(BPF_FS_EXTENDED_DIR "/scx_hybr_data");
+	unlink(BPF_FS_EXTENDED_DIR "/scx_hybr_rodata");
 
     /* ---- BPF オブジェクトを開く ---- */
-    skel = SCX_OPS_OPEN(hybrid_ops, scx_hybrid);
+    skel = SCX_OPS_OPEN(extended_ops, scx_extended);
 
     /* ---- preemption_slice_ns を ro-data セクションで設定 ---- */
     skel->rodata->preemption_slice_ns = preemption_ns;
     skel->rodata->global_cfs = global_cfs ? true : false;
 
     /* ---- ロード ---- */
-    SCX_OPS_LOAD(skel, hybrid_ops, scx_hybrid, uei);
+    SCX_OPS_LOAD(skel, extended_ops, scx_extended, uei);
 
     /* ---- CPU ポリシー map への書き込み (load後、attach前) ---- */
     if (parse_cpu_list_and_set_policy(skel->maps.cpu_policy_map,
@@ -404,12 +404,12 @@ int main(int argc, char *argv[])
 
     print_cpu_assignment_summary((int)bpf_map__max_entries(skel->maps.cpu_policy_map));
 
-    bpf_object__pin_maps(skel->obj, BPF_FS_HYBRID_DIR); // BPF Map をピン留め
+    bpf_object__pin_maps(skel->obj, BPF_FS_EXTENDED_DIR); // BPF Map をピン留め
 
     /* ---- アタッチ ---- */
-    link = SCX_OPS_ATTACH(skel, hybrid_ops, scx_hybrid);
+    link = SCX_OPS_ATTACH(skel, extended_ops, scx_extended);
 
-    printf("Hybrid sched_ext scheduler loaded.\n");
+    printf("Extended sched_ext scheduler loaded.\n");
     printf("  preemption_slice_ns = %lu ns (%.3f ms)\n",
            preemption_ns, (double)preemption_ns / 1e6);
     printf("  CFS DSQ mode        = %s\n",
@@ -432,10 +432,10 @@ int main(int argc, char *argv[])
     if (stats_interval > 0)
         print_stats(skel);
 
-    printf("\nEXIT: Hybrid sched_ext scheduler unregistered.\n");
+    printf("\nEXIT: Extended sched_ext scheduler unregistered.\n");
 
     bpf_link__destroy(link);
     UEI_REPORT(skel, uei);
-	scx_hybrid__destroy(skel);
+	scx_extended__destroy(skel);
     return ret < 0 ? -ret : ret;
 }

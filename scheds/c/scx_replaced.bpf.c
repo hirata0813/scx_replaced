@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Hybrid sched_ext Scheduler
+ * Replaced sched_ext Scheduler
  *
  * ロジック:
  *   - タスクはまず、FIFO DSQ (全 CPU で共通のカスタム DSQ) に入る。
@@ -20,14 +20,13 @@
  *   clang -O2 -g -target bpf \
  *     -I /path/to/linux/tools/include \
  *     -I /path/to/scx/scheds/include \
- *     -c hybridv2_scx.bpf.c -o hybridv2_scx.bpf.o
+ *     -c hybrid_scx.bpf.c -o hybrid_scx.bpf.o
  *
- * ユーザー空間ローダーは hybridv2_scx.c を参照。
+ * ユーザー空間ローダーは hybrid_scx.c を参照。
  */
 
 #include "vmlinux.h"
 #include <scx/common.bpf.h>
-#include <bpf/bpf_helpers.h>
 
 char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
@@ -53,8 +52,6 @@ UEI_DEFINE(uei);
 /* ------------------------------------------------------------------ */
 /* デフォルトのプリエンプション・タイムスライス: 50 µs (ghOSt デフォルトと同じ) */
 const volatile u64 preemption_slice_ns = 50000ULL;
-
-const volatile u64 SCX_INTERRUPT_TS = 20000000ULL;
 
 /*
  * true の場合、CFS フェーズは CPU ごとの CFS_DSQ(cpu) ではなく、
@@ -92,10 +89,10 @@ struct task_ctx {
     /* CFS フェーズで，前回実行していた CPU を記録する
      * マイグレーションが発生した際，vtime を適切な値に更新できるようにするため
      */
+    
 
     u64 tasknew;
     u64 firstrun;
-    u64 at_least_once_run;
     u64 real_firstrun;
     bool is_firstrun_logged;
     bool is_realfirstrun_logged;
@@ -401,7 +398,7 @@ static __always_inline void print_vtime_now()
  * にディスパッチして enqueue() をスキップする。
  * ghOSt における ShortQueueSchedule() の CPU 空き確認に相当。
  */
-s32 BPF_STRUCT_OPS(hybridv2_select_cpu, struct task_struct *p,
+s32 BPF_STRUCT_OPS(replaced_select_cpu, struct task_struct *p,
                    s32 prev_cpu, u64 wake_flags)
 {
     bool is_idle = false;
@@ -440,7 +437,7 @@ s32 BPF_STRUCT_OPS(hybridv2_select_cpu, struct task_struct *p,
  *   TaskPreempted が時間超過を検出して TaskNewToCfs() を呼ぶパスは
  *   stopping() コールバック側で行う。
  */
-void BPF_STRUCT_OPS(hybridv2_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(replaced_enqueue, struct task_struct *p, u64 enq_flags)
 {
     struct task_ctx *tctx = NULL;
     tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
@@ -462,32 +459,23 @@ void BPF_STRUCT_OPS(hybridv2_enqueue, struct task_struct *p, u64 enq_flags)
 	return;
     }
 
-    //bpf_printk("enqueue(): pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm, tctx->is_enqueue_passed, tctx->at_least_once_run);
-    if (!tctx->at_least_once_run && tctx->tasknew == 0) {
-        //bpf_printk("enqueue(): tasknew stamped: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm, tctx->is_enqueue_passed, tctx->at_least_once_run);
-        tctx->tasknew = bpf_ktime_get_ns(); // 割り込み実行の直前を tasknew とする(拡張なし版とタイミング的に同一)
+    if (!tctx->is_enqueue_passed) {
+	tctx->is_enqueue_passed = 1;
+        tctx->tasknew = bpf_ktime_get_ns();   // 意図通り CPU が選ばれたときを tasknew とする
+        //bpf_printk("enqueue(): tasknew stamped: pid:%d, comm:%s", p->pid, p->comm);
     }
 
-    // まだ1度も run してない場合，ランダムに CPU を選択し，20ms 割り込ませて実行
-    if (!tctx->at_least_once_run) {
-        //bpf_printk("enqueue(): interrupt: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm, tctx->is_enqueue_passed, tctx->at_least_once_run);
-	__u32 random_cpu = bpf_get_prandom_u32() % 30; // FIFO/CFS CPU の中から選択
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | random_cpu, SCX_INTERRUPT_TS, SCX_ENQ_HEAD); // プリエンプションのフラグだと，現在動いているフィボナッチタスクも止めてしまい，ET に影響を及ぼす
-	return;
-    }
-
-    tctx->is_enqueue_passed = 1; // ランダムな CPU 割当による割込実行を終え，FIFO/CFS のハイブリッドスケジューリングに入る
     if (!tctx->promoted) {
         /* FIFO フェーズ */
         stat_inc(STAT_FIFO_ENQUEUE);
-        //bpf_printk("enqueue(): FIFO: pid:%d, comm:%s,is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm, tctx->is_enqueue_passed, tctx->at_least_once_run);
+        //bpf_printk("enqueue(): FIFO: pid:%d, comm:%s, scx.slice:%llu, allow:%d", p->pid, p->comm, p->scx.slice, p->nr_cpus_allowed);
 
         /*
          * 関連研究では，FIFO キューはグローバルキューとして実装していたため，本実装もそのようにする
          */
         scx_bpf_dsq_insert(p, GLOBAL_FIFO_DSQ, preemption_slice_ns, enq_flags);
     } else {
-        //bpf_printk("enqueue(): CFS: pid:%d, comm:%s,is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm, tctx->is_enqueue_passed, tctx->at_least_once_run);
+        //bpf_printk("enqueue(): CFS: pid:%d, comm:%s, scx.slice:%llu, allow:%d", p->pid, p->comm, p->scx.slice, p->nr_cpus_allowed);
         /* CFS フェーズ: vtime ベース */
 
         /* CFS フェーズでは，vtime の小さい順にスケジューリングされる
@@ -543,6 +531,7 @@ void BPF_STRUCT_OPS(hybridv2_enqueue, struct task_struct *p, u64 enq_flags)
         stat_inc(STAT_CFS_ENQUEUE);
 
         scx_bpf_dsq_insert_vtime(p, dsq_id, CFS_SCHED_SLICE_NS, vtime, enq_flags);
+
     }
 }
 
@@ -558,7 +547,7 @@ void BPF_STRUCT_OPS(hybridv2_enqueue, struct task_struct *p, u64 enq_flags)
  * ghOSt ShortQueueSchedule() における short_queue_ 優先、
  * 次に long_cpulist 上の CFS という順序と対応する。
  */
-void BPF_STRUCT_OPS(hybridv2_dispatch, s32 cpu, struct task_struct *prev)
+void BPF_STRUCT_OPS(replaced_dispatch, s32 cpu, struct task_struct *prev)
 {
     if(is_fifo_cpu(cpu)){
         /*
@@ -586,7 +575,7 @@ void BPF_STRUCT_OPS(hybridv2_dispatch, s32 cpu, struct task_struct *prev)
  *
  * ghOSt TaskOnCpu() に相当。
  */
-void BPF_STRUCT_OPS(hybridv2_running, struct task_struct *p)
+void BPF_STRUCT_OPS(replaced_running, struct task_struct *p)
 {
     struct task_ctx *tctx;
 
@@ -596,7 +585,7 @@ void BPF_STRUCT_OPS(hybridv2_running, struct task_struct *p)
     tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 
     if (!tctx || p->nr_cpus_allowed == 1) {
-        /* フォールバック: メトリクスの更新などは行わない*/
+        /* フォールバック: メトリクスの更新などは行わない */
         return;
     }
 
@@ -606,30 +595,18 @@ void BPF_STRUCT_OPS(hybridv2_running, struct task_struct *p)
 	return;
     }
 
-    // 20ms 割込時の firstrun を，real_firstrun として取得
-    if (tctx->is_enqueue_passed == 0 && tctx->at_least_once_run == 0 && !tctx->is_realfirstrun_logged && tctx->tasknew > 0){
-        //bpf_printk("running(): real_firstrun stamped: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
-        tctx->real_firstrun               = bpf_ktime_get_ns();
-        tctx->is_realfirstrun_logged = 1;
-    }
-
-    if (!tctx->at_least_once_run) {
-        return;
-    }
-
-    // ここから下は，初回 20ms 割り込みが終わった後の処理
-    // 20ms 割込を終え，意図的に CPU を選ばれた後の，初回 running 呼出を firstrun とする
-    if (tctx->is_enqueue_passed == 1 && !tctx->is_firstrun_logged){
-        //bpf_printk("running(): firstrun stamped: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
+    // enqueue()により，意図通りに FIFO の CPU が選ばれた後の初回 running 呼出を firstrun とする
+    if (tctx->is_enqueue_passed == 1 && !tctx->is_firstrun_logged && tctx->tasknew > 0){
         tctx->firstrun               = bpf_ktime_get_ns();
         tctx->is_firstrun_logged = 1;
+        //bpf_printk("running(): firstrun stamped: pid:%d, comm:%s", p->pid, p->comm);
     }
+
 
     if (!tctx->promoted) {
         /* FIFO フェーズ: 特にやることはなし*/
-        //bpf_printk("running(): FIFO: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
     } else {
-        //bpf_printk("running(): CFS: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
+        //bpf_printk("running(): CFS: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, pass:%d, allow:%d", p->pid, p->comm, cpu2, p->scx.slice, tctx->is_enqueue_passed, p->nr_cpus_allowed);
         /* CFS フェーズ: スライス開始時点での CPU 累積実行時間を記録し，vtime_now を最新化
          *              CPU 累積実行時間を記録するのは，stopping() で，そのスライスでの CPU 利用時間を計算し，タスクの vtime を更新するため
          */
@@ -665,7 +642,7 @@ void BPF_STRUCT_OPS(hybridv2_running, struct task_struct *p)
  *
  * @runnable: true であればタスクはまだ実行可能 (スライス切れ等でプリエンプト)
  */
-void BPF_STRUCT_OPS(hybridv2_stopping, struct task_struct *p, bool runnable)
+void BPF_STRUCT_OPS(replaced_stopping, struct task_struct *p, bool runnable)
 {
     struct task_ctx *tctx;
 
@@ -683,18 +660,9 @@ void BPF_STRUCT_OPS(hybridv2_stopping, struct task_struct *p, bool runnable)
     }
 
     s32 cpu2 = bpf_get_smp_processor_id();
-    /*
-     * タスクの初回実行時かつ，すでに tasknew が記録されているときに，at_least_once_run フラグを立てる
-     * 計測の都合上，タスクが sched_ext 制御下に入って最初に呼び出されるのは stopping ハンドラなので，tasknew が記録されているかも見ないと，enqueue で割込処理に分岐できなくなる
-     */
-    if (!tctx->at_least_once_run && tctx->tasknew > 0) {
-        //bpf_printk("stopping(): at_least_once_run = 1: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
-	tctx->at_least_once_run         = 1;
-        return;
-    }
 
     if (tctx->promoted) {
-        //bpf_printk("stopping(): CFS: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
+        //bpf_printk("stopping(): CFS: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, pass:%d, allow:%d", p->pid, p->comm, cpu2, p->scx.slice, tctx->is_enqueue_passed, p->nr_cpus_allowed);
         /*
          * CFS フェーズ: 実際に消費した CPU 時間を vtime に反映。
          * nice 値対応が必要なら inverse_weight を掛け算する。
@@ -733,10 +701,10 @@ void BPF_STRUCT_OPS(hybridv2_stopping, struct task_struct *p, bool runnable)
      *      p->scx.slice == 0 は，与えられたタイムスライスを使い果たしたことを示す
      *      p->scx.slice > 0 は，他の高優先度タスク(カーネルスレッドなど)に割り込まれたか，自発的にブロックしたかのどちらか
      */
-    //bpf_printk("stopping(): FIFO: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
+    //bpf_printk("stopping(): FIFO: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, runnable:%d", p->pid, p->comm, cpu2, p->scx.slice, runnable);
     if (runnable && p->scx.slice == 0 && tctx->is_enqueue_passed == 1) {
         /* CFS フェーズへ昇格 */
-        //bpf_printk("stopping(): FIFO -> CFS: pid:%d, comm:%s, is_enqueue_passed:%d, at_least_once_run:%d", p->pid, p->comm,  tctx->is_enqueue_passed, tctx->at_least_once_run);
+        //bpf_printk("stopping(): FIFO -> CFS: pid:%d, comm:%s, cpu:%d, scx.slice:%llu, runnable:%d", p->pid, p->comm, cpu2, p->scx.slice, runnable);
         tctx->promoted = true;
         /*
          * 初回 vtime は0に設定 (enqueue()で，選択された CFS DSQ の vtime_now を基準にクランプされるため)
@@ -757,7 +725,7 @@ void BPF_STRUCT_OPS(hybridv2_stopping, struct task_struct *p, bool runnable)
  *
  * ghOSt TaskNew() に相当。
  */
-void BPF_STRUCT_OPS(hybridv2_enable, struct task_struct *p)
+void BPF_STRUCT_OPS(replaced_enable, struct task_struct *p)
 {
     struct task_ctx *tctx;
 
@@ -773,14 +741,12 @@ void BPF_STRUCT_OPS(hybridv2_enable, struct task_struct *p)
     tctx->tasknew               = 0;
     tctx->firstrun              = 0;
     tctx->real_firstrun         = 0;
-    tctx->at_least_once_run         = 0;
     tctx->is_firstrun_logged    = 0;
     tctx->is_realfirstrun_logged    = 0;
     tctx->is_enqueue_passed     = 0;
     tctx->taskdead              = 0;
 
     stat_inc(STAT_ENABLE_INVOKE);
-    //bpf_printk("enable(): pid:%d, comm:%s, scx.slice:%llu, on_cpu:%d, on_rq: %d", p->pid, p->comm, p->scx.slice, p->on_cpu, p->on_rq);
 }
 
 /* ------------------------------------------------------------------ */
@@ -790,7 +756,7 @@ void BPF_STRUCT_OPS(hybridv2_enable, struct task_struct *p)
  * タスクが終了し，sched_ext の制御下が外れるときに呼ばれる。
  * タスクの終了時刻を記録する。
  */
-void BPF_STRUCT_OPS(hybridv2_disable, struct task_struct *p)
+void BPF_STRUCT_OPS(replaced_disable, struct task_struct *p)
 {
     struct task_ctx *tctx;
 
@@ -806,8 +772,8 @@ void BPF_STRUCT_OPS(hybridv2_disable, struct task_struct *p)
         bpf_map_update_elem(&firstrun_map, &pid, &tctx->firstrun, BPF_ANY);
         bpf_map_update_elem(&real_firstrun_map, &pid, &tctx->real_firstrun, BPF_ANY);
         bpf_map_update_elem(&taskdead_map, &pid, &tctx->taskdead, BPF_ANY);
+	//bpf_printk("disable(): pid:%d, comm:%s, tasknew:%llu, firstrun:%llu, taskdead: %llu", p->pid, p->comm, tctx->tasknew, tctx->firstrun, tctx->taskdead);
     }
-    //bpf_printk("disable(): pid:%d, comm:%s", p->pid, p->comm);
 }
 
 /* ------------------------------------------------------------------ */
@@ -816,7 +782,7 @@ void BPF_STRUCT_OPS(hybridv2_disable, struct task_struct *p)
 /*
  * スケジューラ初期化。カスタム DSQ を作成する。
  */
-s32 BPF_STRUCT_OPS_SLEEPABLE(hybridv2_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(replaced_init)
 {
     s32 cpu;
     s32 err;
@@ -847,7 +813,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(hybridv2_init)
 /* ------------------------------------------------------------------ */
 /* ops.exit                                                             */
 /* ------------------------------------------------------------------ */
-void BPF_STRUCT_OPS(hybridv2_exit, struct scx_exit_info *ei)
+void BPF_STRUCT_OPS(replaced_exit, struct scx_exit_info *ei)
 {
     UEI_RECORD(uei, ei);
 }
@@ -856,16 +822,16 @@ void BPF_STRUCT_OPS(hybridv2_exit, struct scx_exit_info *ei)
 /* struct sched_ext_ops 定義                                            */
 /* ------------------------------------------------------------------ */
 SEC(".struct_ops.link")
-struct sched_ext_ops hybridv2_ops = {
-    .select_cpu = (void *)hybridv2_select_cpu,
-    .enqueue    = (void *)hybridv2_enqueue,
-    .dispatch   = (void *)hybridv2_dispatch,
-    .running    = (void *)hybridv2_running,
-    .stopping   = (void *)hybridv2_stopping,
-    .enable     = (void *)hybridv2_enable,
-    .disable    = (void *)hybridv2_disable,
-    .init       = (void *)hybridv2_init,
-    .exit       = (void *)hybridv2_exit,
+struct sched_ext_ops replaced_ops = {
+    .select_cpu = (void *)replaced_select_cpu,
+    .enqueue    = (void *)replaced_enqueue,
+    .dispatch   = (void *)replaced_dispatch,
+    .running    = (void *)replaced_running,
+    .stopping   = (void *)replaced_stopping,
+    .enable     = (void *)replaced_enable,
+    .disable    = (void *)replaced_disable,
+    .init       = (void *)replaced_init,
+    .exit       = (void *)replaced_exit,
     //.flags      = SCX_OPS_SWITCH_PARTIAL,
-    .name       = "hybridv2",
+    .name       = "replaced",
 };
